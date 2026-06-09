@@ -3,11 +3,14 @@
 ## Goal
 Replicate the headset ↔ speaker output switch that normally requires the Windows driver or a physical button press, so it can be triggered programmatically on Linux.
 
-**Status: SOLVED.** The SET command is known and confirmed working on Windows (COM3) and will work identically on Linux (`/dev/ttyACM0`).
+**Status: FULLY IMPLEMENTED. Handshake key and algorithm extracted; `send_tty.py` can initialise the device from cold.**
+
+The `5a 2c 05 00 [mode] 00 00 00` SET command is confirmed correct. Newer firmware requires a startup handshake (AES-256-GCM challenge-response) before accepting any 5A commands. The key has been extracted from `CTCDC.dll` and the algorithm reverse-engineered. Use `--handshake` to initialise a cold device.
 
 ```bash
-# Linux — switch output programmatically (no Creative app, no button press needed)
-sudo .venv/bin/python scripts/send_tty.py headset   # or: speaker
+# Linux — switch output (device must already be initialised, or use --handshake)
+sudo .venv/bin/python scripts/send_tty.py headset --handshake   # cold device
+sudo .venv/bin/python scripts/send_tty.py headset               # already initialised
 ```
 
 ## Device
@@ -29,6 +32,67 @@ sudo .venv/bin/python scripts/send_tty.py headset   # or: speaker
 **Key insight**: Interfaces 1+2 (cdc_acm) expose `/dev/ttyACM0` on Linux — this is the proprietary command channel.
 
 ALSA/alsamixer has no visibility into the output switch; it is vendor-specific and goes over this CDC bulk pipe.
+
+## Startup handshake (newer firmware, required before any 5A command)
+
+The CDC channel (`/dev/ttyACM0` / `COM3`) requires a text-phase handshake before the device will respond to 5A binary commands. Older firmware (e.g. SoundBlasterX G6) skips this entirely; CTCDC.dll contains the branch: *"No unlocking is necessary because of old firmware."*
+
+### Handshake sequence
+
+```
+Host  -> "whoareyou.MyApp8\r\n"
+         (retry every ~2 s until device responds — device needs boot time)
+
+Device-> "whoareyou" + <36-byte nonce> + "\r\n"
+         (or "NotYet\r\n" if still booting)
+         nonce structure: 4 fixed bytes (1e 04 64 32) + 32 random bytes
+
+Host  -> "unlock" + <64-byte AES-256-GCM payload> + "\r\n"
+         payload = iv(16) + ct(32) + gcm_tag(16)
+
+Device-> "unlock_OK\r\n"   (success) or "unlock_FAIL\r\n" (wrong key/response)
+
+Host  -> "SW_MODE1\r\n"    (enter software-control mode)
+
+Device-> 5B 02 0A 00 <10 bytes firmware info>
+         (e.g. 6d 00 00 00 00 00 00 00 00 00; first byte may be firmware build)
+```
+
+After this, the 5A binary protocol works. The device sends `5a 03 02 3b 00` in response to a `5a 03 00` ping.
+
+### AES-256-GCM algorithm (fully extracted from CTCDC.dll)
+
+```python
+def compute_unlock_response(nonce: bytes) -> bytes:
+    key = _load_key()                                    # 32 bytes from SB_CTCDC_KEY env var
+    # nonce[0:4] is always 1e 04 64 32 (fixed header); the mixing is therefore constant
+    session_key = nonce[0:2] + key[2:30] + nonce[2:4]   # 32-byte AES-256-GCM key
+    iv  = os.urandom(16)
+    cipher = AES.new(session_key, AES.MODE_GCM, nonce=iv[:12])
+    ct, tag = cipher.encrypt_and_digest(nonce[4:])      # encrypt the 32 random challenge bytes
+    return iv + ct + tag                                 # 16 + 32 + 16 = 64 bytes
+```
+
+Implemented in `scripts/send_tty.py` (`compute_unlock_response`) and callable via `--handshake`.
+The key is loaded from the `SB_CTCDC_KEY` environment variable — not hardcoded in source.
+
+| Item | Value |
+|------|-------|
+| Algorithm | AES-256-GCM |
+| Key location | `CTCDC.dll` addresses `0x101d9a74`–`0x101d9a93` (32 raw bytes) |
+| Key function | `FUN_1000d330` / `DoExecuteCommand_CTCDCCMD_Unlock` in Ghidra |
+| Session key | `nonce[0:2] + KEY[2:30] + nonce[2:4]` — constant since nonce header is fixed |
+| GCM nonce | First 12 bytes of the random IV |
+| Plaintext | `nonce[4:]` — the 32 random challenge bytes |
+| Response format | `iv(16) \|\| ct(32) \|\| gcm_tag(16)` = 64 bytes |
+| Verified against | Wireshark capture `capture-app-startup-2.pcapng` — CT and tag match exactly |
+
+**To use:** extract 32 bytes from `0x101d9a74`–`0x101d9a93` in your own copy of
+`C:\Program Files (x86)\Creative\Creative App\CTCDC.dll` using Ghidra, then:
+```bash
+export SB_CTCDC_KEY=<64 hex chars>
+sudo .venv/bin/python scripts/send_tty.py headset --handshake
+```
 
 ## Discovered protocol (device → host notifications)
 
@@ -82,11 +146,13 @@ Linux scripts require root (`sudo`). Windows scripts run as a normal user.
 |--------|----------|---------|
 | `find_device.py` | Linux | Enumerate interfaces and endpoints |
 | `listen_tty.py` | Linux/Windows | Read raw bytes from the CDC command channel |
-| `send_tty.py` | Linux/Windows | Write a command to the CDC channel and read response |
+| `send_tty.py` | Linux/Windows | Write a command to the CDC channel; `--handshake` for cold device |
 | `capture_usbmon.py` | Linux | Passive usbmon capture (needs `sudo modprobe usbmon`) |
 | `replay.py` | Linux | Low-level pyusb control/bulk/HID probing |
 | `find_com_port.py` | Windows | Auto-detect the Sound Blaster COM port |
 | `parse_pcap.py` | Windows | Extract bulk OUT packets from a Wireshark pcapng (needs tshark) |
+| `test_handshake.py` | Windows/Linux | Run the real AES-256-GCM handshake against a cold device |
+| `test_crypto.py` | Any | Verify the extracted key against the known challenge-response pair |
 
 ### Linux commands
 ```bash
@@ -110,11 +176,14 @@ uv run python scripts/find_com_port.py
 # 2. Listen on that COM port — press button to see device notifications
 uv run python scripts/listen_tty.py --dev COM3
 
-# 3. After capturing with Wireshark, parse the pcapng to find the SET command
-uv run python scripts/parse_pcap.py capture.pcapng --dev 70 --out findings.txt
+# 3. Test the full handshake against a cold device (stop Creative app first)
+uv run python scripts/test_handshake.py --dev COM3
 
-# 4. Once SET command is known, try sending it
+# 4. Send a command (device already initialised by Creative app)
 uv run python scripts/send_tty.py headset --dev COM3
+
+# 5. Send a command on a cold device (handshake included)
+uv run python scripts/send_tty.py headset --dev COM3 --handshake
 ```
 
 ## Windows capture plan (find the SET command)

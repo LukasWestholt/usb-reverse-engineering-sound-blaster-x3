@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parse a Wireshark pcapng capture and extract USB bulk transfers for the Sound Blaster X3.
+Parse a Wireshark pcapng capture and extract USB bulk transfers for the Sound Blaster X3/X4.
 
 Requires tshark (installed with Wireshark).  Default: show only bulk OUT (host→device)
 because those are the SET commands we need to discover.
@@ -19,6 +19,15 @@ Usage:
     python scripts/parse_pcap.py capture.pcapng --dev 70
     python scripts/parse_pcap.py capture.pcapng --both-dirs
     python scripts/parse_pcap.py capture.pcapng --out findings.txt
+
+Startup handshake (host→device then device→host on EP 0x03/0x82):
+  Host  -> "whoareyou.MyApp8\\r\\n"           (poll until device is ready)
+  Device-> "whoareyou" + 36-byte nonce + "\\r\\n"
+  Host  -> "unlock" + 64-byte HMAC + "\\r\\n"  (key unknown, in CTCDC.dll)
+  Device-> "unlock_OK\\r\\n"
+  Host  -> "SW_MODE1\\r\\n"
+  Device-> 5b 02 0a 00 [10 bytes firmware info]
+  Then normal 5A protocol begins.
 """
 import argparse
 import shutil
@@ -40,6 +49,27 @@ KNOWN_NOTIFY: dict[tuple[int, bytes], str] = {
     (0x24, bytes([0x00, 0x00])): "NOTIFY  (mode-change marker, cmd=24)",
     (0x1A, bytes([0x02, 0x00])): "NOTIFY  (mode-change marker, cmd=1a)",
 }
+
+# Known text-phase handshake messages (CDC channel, before 5A protocol)
+def decode_text_handshake(data: bytes) -> str | None:
+    """Return a label if this is a recognised text-phase handshake message, else None."""
+    if data == b"whoareyou.MyApp8\r\n":
+        return "HANDSHAKE host->dev  'whoareyou.MyApp8'"
+    if data.startswith(b"whoareyou") and data.endswith(b"\r\n"):
+        nonce = data[9:-2]
+        return f"HANDSHAKE dev->host  challenge nonce ({len(nonce)} bytes): {nonce.hex()}"
+    if data == b"unlock_OK\r\n":
+        return "HANDSHAKE dev->host  unlock_OK  (authentication succeeded)"
+    if data.startswith(b"unlock") and data.endswith(b"\r\n"):
+        mac = data[6:-2]
+        return f"HANDSHAKE host->dev  unlock + {len(mac)}-byte response: {mac.hex()}"
+    if data == b"NotYet\r\n":
+        return "HANDSHAKE dev->host  NotYet  (device not ready yet)"
+    if data == b"SW_MODE1\r\n":
+        return "HANDSHAKE host->dev  SW_MODE1  (enter software-control mode)"
+    if data[0:1] == b"\x5b" and len(data) >= 4:
+        return f"HANDSHAKE dev->host  5B-frame (SW_MODE1 ack): {data.hex()}"
+    return None
 
 
 def find_tshark() -> str:
@@ -64,6 +94,10 @@ def decode_5a(data: bytes) -> str:
     label = KNOWN_NOTIFY.get((cmd, bytes(payload)))
     if label:
         return label
+    # cmd=0x09 with payload starting 02 10 = firmware version string
+    if cmd == 0x09 and length >= 3 and payload[0:2] == bytes([0x02, 0x10]):
+        ver = payload[2:].rstrip(b"\x00").decode("ascii", errors="replace")
+        return f"5A cmd=0x09 FIRMWARE VERSION = {ver!r}"
     return f"5A cmd=0x{cmd:02X} len={length} payload={payload.hex()}"
 
 
@@ -107,6 +141,7 @@ def main() -> None:
             "-e", "usb.endpoint_address",
             "-e", "usb.endpoint_address.direction",
             "-e", "usbcom.data.out_payload",
+            "-e", "usbcom.data.in_payload",
             "-E", "separator=\t",
             "-E", "header=y",
         ],
@@ -136,8 +171,11 @@ def main() -> None:
         dev_addr = parts[2]
         ep_hex = parts[3]
         direction = parts[4]
-        capdata_raw = parts[5] if len(parts) > 5 else ""
+        out_raw = parts[5] if len(parts) > 5 else ""
+        in_raw  = parts[6] if len(parts) > 6 else ""
 
+        # Use whichever payload field is populated
+        capdata_raw = out_raw if out_raw else in_raw
         capdata_hex = capdata_raw.replace(":", "")
         try:
             ep = int(ep_hex, 16) if ep_hex else 0
@@ -154,7 +192,10 @@ def main() -> None:
         if capdata_hex:
             try:
                 raw = bytes.fromhex(capdata_hex)
-                if raw and raw[0] == 0x5A:
+                hs = decode_text_handshake(raw)
+                if hs:
+                    annotation = f"\n      -> {hs}"
+                elif raw and raw[0] == 0x5A:
                     annotation = f"\n      -> {decode_5a(raw)}"
                 elif raw:
                     annotation = f"\n      -> (non-5A payload)"
