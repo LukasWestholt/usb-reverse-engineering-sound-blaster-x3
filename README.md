@@ -7,11 +7,16 @@ Switch the headset/speaker output on a Creative Sound Blaster X3 (USB ID `041e:3
 ```bash
 uv sync
 
-# Device already initialised (Creative app ran once, or firmware is old):
-sudo SB_CTCDC_KEY=<hex> .venv/bin/python scripts/send_tty.py headset
+# Switch output — handshake is detected automatically:
+SB_CTCDC_KEY=<hex> .venv/bin/python scripts/send_tty.py headset
+SB_CTCDC_KEY=<hex> .venv/bin/python scripts/send_tty.py speaker
+```
 
-# Cold device — perform the AES-256-GCM startup handshake first:
-sudo SB_CTCDC_KEY=<hex> .venv/bin/python scripts/send_tty.py headset --handshake
+With the [udev rule](#optional-udev-rule-linux-no-sudo-for-serial-port) and [fish function](#optional-fish-shell-function) installed, this simplifies to:
+
+```fish
+sbx headset
+sbx speaker
 ```
 
 See [Setup: extracting the key](#setup-extracting-the-key) for how to get `SB_CTCDC_KEY`.
@@ -104,7 +109,7 @@ Byte[3] distinguishes host commands (`0x00`) from device notifications (`0x01`).
 
 | Script | Platform | Purpose |
 |--------|----------|---------|
-| `send_tty.py` | Linux/Windows | Send a SET command; `--handshake` for cold device |
+| `send_tty.py` | Linux/Windows | Send a SET command; auto-detects handshake by default |
 | `listen_tty.py` | Linux/Windows | Watch raw device notifications (press button to trigger) |
 | `test_handshake.py` | Linux/Windows | Run and verify the full AES-256-GCM handshake |
 | `test_crypto.py` | Any | Verify your extracted key against a known challenge-response |
@@ -119,21 +124,21 @@ Byte[3] distinguishes host commands (`0x00`) from device notifications (`0x01`).
 ```bash
 export SB_CTCDC_KEY=<hex>   # see Setup section above
 
-# Switch output (cold device — handshake included)
-sudo SB_CTCDC_KEY=$SB_CTCDC_KEY .venv/bin/python scripts/send_tty.py headset --handshake
-sudo SB_CTCDC_KEY=$SB_CTCDC_KEY .venv/bin/python scripts/send_tty.py speaker --handshake
+# Switch output — handshake is detected automatically (with udev rule, no sudo needed)
+.venv/bin/python scripts/send_tty.py headset
+.venv/bin/python scripts/send_tty.py speaker
 
-# Device already initialised (no handshake needed)
-sudo SB_CTCDC_KEY=$SB_CTCDC_KEY .venv/bin/python scripts/send_tty.py headset
+# Force full handshake retry loop (device still booting after cold plug-in)
+.venv/bin/python scripts/send_tty.py headset --handshake
 
 # Send arbitrary hex payload
-sudo SB_CTCDC_KEY=$SB_CTCDC_KEY .venv/bin/python scripts/send_tty.py raw 5a2c050004000000
+.venv/bin/python scripts/send_tty.py raw 5a2c050004000000
 
 # Test the handshake against a cold device
-sudo SB_CTCDC_KEY=$SB_CTCDC_KEY .venv/bin/python scripts/test_handshake.py
+.venv/bin/python scripts/test_handshake.py
 
 # Watch device notifications (press button while running)
-sudo .venv/bin/python scripts/listen_tty.py
+.venv/bin/python scripts/listen_tty.py
 
 # Passive USB capture (both directions)
 sudo modprobe usbmon
@@ -167,6 +172,28 @@ uv run python scripts/parse_pcap.py capture.pcapng --both-dirs --out findings.tx
 echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="041e", ATTRS{idProduct}=="3264", MODE="0666"' \
   | sudo tee /etc/udev/rules.d/99-soundblaster-x3.rules
 sudo udevadm control --reload && sudo udevadm trigger
+```
+
+### Optional: fish shell function
+
+After applying the udev rule, install a fish function so you can run `sbx headset` from any directory without a full path or venv prefix.
+
+Create `~/.config/fish/functions/sbx.fish`:
+
+```fish
+function sbx --description "Sound Blaster X3 output switch (headset | speaker | raw <hex>)"
+    set -l project /path/to/usb-reverse-engineering-sound-blaster-x3
+    $project/.venv/bin/python $project/scripts/send_tty.py $argv
+end
+```
+
+Replace `/path/to/...` with the absolute path to this repository. Open a new shell and use:
+
+```fish
+sbx headset     # auto-detects whether handshake is needed
+sbx speaker
+sbx raw 5a2c050004000000
+sbx headset --handshake   # force retry loop for a freshly plugged-in device
 ```
 
 ## Protocol reference

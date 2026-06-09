@@ -1,5 +1,5 @@
 [project]
-name = "usb-reverse-engineering-sound-blaster-x4"
+name = "usb-reverse-engineering-sound-blaster-x3"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
